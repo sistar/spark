@@ -49,6 +49,8 @@ class DirectKafkaStreamSuite
   with Logging {
   val sparkConf = new SparkConf()
     .setMaster("local[4]")
+    .set("spark.cores", "4")
+    .set("spark.io.compression.codec", "org.apache.spark.io.LZ4CompressionCodec")
     .setAppName(this.getClass.getSimpleName)
 
   private var sc: SparkContext = _
@@ -82,15 +84,113 @@ class DirectKafkaStreamSuite
     }
   }
 
+  test("stream with map and subsequent window should yield RDDs") {
+    val topic = "basic"
+
+    val batchMs = 200
+    val windowTimesBatch = 2
+    kafkaTestUtils.createTopic(topic)
+
+    val kafkaParams = Map(
+      "metadata.broker.list" -> kafkaTestUtils.brokerAddress,
+      "auto.offset.reset" -> "smallest"
+    )
+
+    ssc = new StreamingContext(sparkConf, Milliseconds(batchMs))
+    val stream = withClue("Error creating direct stream") {
+      KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
+        ssc, kafkaParams, Set(topic))
+    }
+    var rddCount = 0
+
+
+    val windowedStream: DStream[(String, String)] = stream.map { x => x}.window(Milliseconds(batchMs*windowTimesBatch))
+
+    windowedStream.foreachRDD { rdd =>
+      rddCount += 1
+      println(s"$rddCount -> $rdd")
+    }
+    ssc.start()
+    eventually(timeout(20000.milliseconds), interval(50.milliseconds)) {
+      assert( rddCount > 30,
+        s"rdd generation halted after $rddCount rdds")
+    }
+    ssc.stop()
+  }
+
+  test("stream with map and subsequent window") {
+    val topic = "basic"
+    val data = Map("a" -> 2, "b" -> 2)
+    val batchMs = 200
+    val windowTimesBatch = 2
+    kafkaTestUtils.createTopic(topic)
+    kafkaTestUtils.sendMessages(topic, data)
+
+    val totalSent = data.values.sum
+    val kafkaParams = Map(
+      "metadata.broker.list" -> kafkaTestUtils.brokerAddress,
+      "auto.offset.reset" -> "smallest"
+    )
+
+    ssc = new StreamingContext(sparkConf, Milliseconds(batchMs))
+    val stream = withClue("Error creating direct stream") {
+      KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
+        ssc, kafkaParams, Set(topic))
+    }
+    var rddCount = 0
+    val allReceived =
+      new ArrayBuffer[(String, String)] with mutable.SynchronizedBuffer[(String, String)]
+
+    // hold a reference to the current offset ranges, so it can be used downstream
+    var offsetRanges = Array[OffsetRange]()
+
+    val windowedStream: DStream[(String, String)] = stream.transform { rdd =>
+      // Get the offset ranges in the RDD
+      offsetRanges = rdd.asInstanceOf[HasOffsetRanges].offsetRanges
+      rdd
+    }.map { x => x}.window(Milliseconds(batchMs*windowTimesBatch))
+
+    windowedStream.foreachRDD { rdd =>
+      //println(rdd)
+      for (o <- offsetRanges) {
+        println(s"topic: ${o.topic} part: ${o.partition} ${o.fromOffset} ${o.untilOffset}")
+      }
+      val collected = rdd.mapPartitionsWithIndex { (i, iter) =>
+        // For each partition, get size of the range in the partition,
+        // and the number of items in the partition
+        val off = offsetRanges(i)
+        val all = iter.toSeq
+        val partSize = all.size
+        val rangeSize = off.untilOffset - off.fromOffset
+        Iterator((partSize, rangeSize))
+      }.collect
+
+      // Verify whether number of elements in each partition
+      // matches with the corresponding offset range
+      collected.foreach { case (partSize, rangeSize) =>
+        assert(partSize === rangeSize, "offset ranges are wrong")
+      }
+    }
+    windowedStream.foreachRDD { rdd => allReceived ++= rdd.collect()
+                        rddCount += 1
+      println(s"$rddCount -> $rdd")
+    }
+    ssc.start()
+    eventually(timeout(20000.milliseconds), interval(50.milliseconds)) {
+      assert(allReceived.size === totalSent * windowTimesBatch && rddCount > 30,
+        "didn't get expected number of messages, messages:\n" + allReceived.mkString("\n"))
+    }
+    ssc.stop()
+  }
 
   test("basic stream receiving with multiple topics and smallest starting offset") {
-    val topics = Set("basic1", "basic2", "basic3")
-    val data = Map("a" -> 7, "b" -> 9)
-    topics.foreach { t =>
-      kafkaTestUtils.createTopic(t)
-      kafkaTestUtils.sendMessages(t, data)
-    }
-    val totalSent = data.values.sum * topics.size
+    val topic = "basic1"
+    val data = Map("a,1" -> 10000, "b,7" -> 10000)
+
+      kafkaTestUtils.createTopic(topic)
+      kafkaTestUtils.sendMessages(topic, data)
+
+    val totalSent = data.values.sum
     val kafkaParams = Map(
       "metadata.broker.list" -> kafkaTestUtils.brokerAddress,
       "auto.offset.reset" -> "smallest"
@@ -99,7 +199,12 @@ class DirectKafkaStreamSuite
     ssc = new StreamingContext(sparkConf, Milliseconds(200))
     val stream = withClue("Error creating direct stream") {
       KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
-        ssc, kafkaParams, topics)
+        ssc, kafkaParams, Set(topic))
+    }
+
+    val streamB = withClue("Error creating direct stream") {
+      KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
+        ssc, kafkaParams, Set(topic))
     }
 
     val allReceived =
@@ -112,7 +217,8 @@ class DirectKafkaStreamSuite
       // Get the offset ranges in the RDD
       offsetRanges = rdd.asInstanceOf[HasOffsetRanges].offsetRanges
       rdd
-    }.foreachRDD { rdd =>
+    }.map{x=>  (x._1,x._2)}.window(Milliseconds(400)).foreachRDD { rdd =>
+      println(rdd)
       for (o <- offsetRanges) {
         logInfo(s"${o.topic} ${o.partition} ${o.fromOffset} ${o.untilOffset}")
       }
@@ -134,7 +240,7 @@ class DirectKafkaStreamSuite
     }
     stream.foreachRDD { rdd => allReceived ++= rdd.collect() }
     ssc.start()
-    eventually(timeout(20000.milliseconds), interval(200.milliseconds)) {
+    eventually(timeout(20000.milliseconds), interval(5800.milliseconds)) {
       assert(allReceived.size === totalSent,
         "didn't get expected number of messages, messages:\n" + allReceived.mkString("\n"))
     }
